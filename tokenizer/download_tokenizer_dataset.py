@@ -6,6 +6,7 @@ from collections import deque
 base_dir = "/mnt/d/workspace_backup/workspace/ai/nanochat_eng/.cache"
 TOKENIZER_DATASET_PATH = os.path.join(base_dir, "tokenizer_dataset")
 REDDIT_DATASET_PATH = os.path.join(base_dir, "reddit_dataset")
+GUTENBERG_DATASET_PATH = os.path.join(base_dir, "gutenberg_dataset")
 
 class FastTextShardWriter:
     def __init__(self, out_dir, shard_size_chars=100_000_000, file_buffer_size=1 << 20):
@@ -134,5 +135,22 @@ def download_reddit_comments_dataset():
             break
     writer.close()
 
+
+def download_gutenberg_dataset():
+    gutenberg_dataset = load_dataset("Navanjana/Gutenberg_books", streaming=True)
+    writer = FastTextShardWriter(out_dir=GUTENBERG_DATASET_PATH, shard_size_chars=100_000_000)
+    max_chars = 700_000_000
+    seen_chars = 0
+    for x in gutenberg_dataset["train"]:
+        raw_text = x["paragraph"]
+        if not raw_text:
+            continue
+        writer.write(raw_text + "\n")
+        seen_chars += len(raw_text)
+        if seen_chars >= max_chars:
+            break
+    writer.close()
+
 download_tokenizer_dataset()
 download_reddit_comments_dataset()
+download_gutenberg_dataset()
