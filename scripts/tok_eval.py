@@ -2,11 +2,23 @@
 Evaluate compression ratio of the tokenizer.
 """
 
+import os
 from nanochat.tokenizer import get_tokenizer, RustBPETokenizer
-from nanochat.dataset import parquets_iter_batched
+from nanochat.common import get_base_dir
+# from nanochat.dataset import parquets_iter_batched
 
 # Random text I got from a random website this morning
 news_text = r"""
+Aditya Vijayvergia
+January February March April May June July August September October November December
+Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec
+Monday Tuesday Wednesday Thursday Friday Saturday Sunday
+Mon Tue Wed Thu Fri Sat Sun
+United States China India United Kingdom France Germany Japan Brazil Canada Australia Italy South Korea Russia Mexico Indonesia Spain Netherlands Saudi Arabia Turkey Switzerland Poland Sweden Belgium Argentina Norway Nigeria Israel Singapore Vietnam Thailand Egypt South Africa United Arab Emirates Denmark Finland Ireland Portugal Greece
+Google Apple Microsoft Amazon Meta Tesla Netflix Nvidia Adobe Salesforce
+New York London Paris Tokyo Beijing Mumbai San Francisco Berlin Sydney Lagos
+John Mary Robert Patricia Michael Linda David Elizabeth Richard Barbara
+Nike Coca-Cola Starbucks Toyota Samsung McDonald's Disney Visa
 (Washington, D.C., July 9, 2025)- Yesterday, Mexico’s National Service of Agro-Alimentary Health, Safety, and Quality (SENASICA) reported a new case of New World Screwworm (NWS) in Ixhuatlan de Madero, Veracruz in Mexico, which is approximately 160 miles northward of the current sterile fly dispersal grid, on the eastern side of the country and 370 miles south of the U.S./Mexico border. This new northward detection comes approximately two months after northern detections were reported in Oaxaca and Veracruz, less than 700 miles away from the U.S. border, which triggered the closure of our ports to Mexican cattle, bison, and horses on May 11, 2025.
 
 While USDA announced a risk-based phased port re-opening strategy for cattle, bison, and equine from Mexico beginning as early as July 7, 2025, this newly reported NWS case raises significant concern about the previously reported information shared by Mexican officials and severely compromises the outlined port reopening schedule of five ports from July 7-September 15. Therefore, in order to protect American livestock and our nation’s food supply, Secretary Rollins has ordered the closure of livestock trade through southern ports of entry effective immediately.
@@ -143,27 +155,47 @@ science_text = r"""
 Photosynthesis is a photochemical energy transduction process in which light-harvesting pigment–protein complexes within the thylakoid membranes of oxygenic phototrophs absorb photons and initiate charge separation at the reaction center, driving the linear electron transport chain from water to NADP⁺ via photosystem II, the cytochrome b₆f complex, and photosystem I, concomitantly generating a trans-thylakoid proton motive force utilized by chloroplastic ATP synthase. The light-dependent reactions produce ATP and NADPH, which fuel the Calvin–Benson–Bassham cycle in the stroma, wherein ribulose-1,5-bisphosphate is carboxylated by ribulose-1,5-bisphosphate carboxylase/oxygenase (RuBisCO) to form 3-phosphoglycerate, subsequently reduced and regenerated through a series of enzymatic steps, enabling net assimilation of CO₂ into triose phosphates and ultimately carbohydrates. This process is tightly regulated by photoprotective mechanisms, redox feedback, and metabolite flux, representing a central biochemical pathway coupling solar energy capture to the biosphere’s primary productivity.
 """.strip()
 
-# The tokenizer was trained on data from earlier shards, so it has seen this data
-train_docs = next(parquets_iter_batched(split="train"))
-train_text = "\n".join(train_docs)
-val_docs = next(parquets_iter_batched(split="val"))
-val_text = "\n".join(val_docs)
+# Read sample text from the custom dataset
+def get_custom_text(shard_idx):
+    base_dir = get_base_dir()
+    data_dir = os.path.join(base_dir, "tokenizer_dataset")
+    if not os.path.exists(data_dir):
+        return ""
+    txt_files = sorted([f for f in os.listdir(data_dir) if f.endswith('.txt')])
+    if not txt_files:
+        return ""
+    
+    # Use the specified shard, or the last one if negative
+    idx = shard_idx if shard_idx >= 0 else len(txt_files) + shard_idx
+    idx = max(0, min(idx, len(txt_files) - 1))
+    
+    filepath = os.path.join(data_dir, txt_files[idx])
+    # Read a chunk of text (e.g., first 100,000 characters)
+    with open(filepath, 'r', encoding='utf-8') as f:
+        text = f.read(100_000)
+    return text, filepath
+
+train_text, train_filepath = get_custom_text(0)
+val_text, val_filepath = get_custom_text(-1)
+
+print("train_filepath", train_filepath)
+print("val_filepath", val_filepath)
 
 all_text = [
-    ("news", news_text),
+    ("english", news_text),
     ("korean", korean_text),
     ("code", code_text),
     ("math", math_text),
     ("science", science_text),
-    ("fwe-train", train_text),
+    ("reddit", train_text),
+    ("wiki", val_text),
 ]
-if val_text:
-    all_text.append(("fwe-val", val_text))
 
 # Try out current default compared to GPT-2 and GPT-4 tokenizers
 tokenizer_results = {}
 vocab_sizes = {}
 
+# for tokenizer_name in ["gpt2", "gpt4", "ours"]:
 for tokenizer_name in ["gpt2", "gpt4", "ours"]:
 
     if tokenizer_name == "gpt2":
@@ -179,6 +211,11 @@ for tokenizer_name in ["gpt2", "gpt4", "ours"]:
     for name, text in all_text:
         encoded = tokenizer.encode(text)
         decoded = tokenizer.decode(encoded)
+        if name == "english":
+            print("="*20)
+            print(f"tokenizer: {tokenizer_name}, text: {text}")
+            for i in range(len(encoded)):
+                print(tokenizer.decode([encoded[i]]))
         assert decoded == text
 
         encoded_bytes = text.encode('utf-8')
