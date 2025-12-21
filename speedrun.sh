@@ -10,10 +10,10 @@
 # 3) Example launch with wandb logging, but see below for setting up wandb first:
 # WANDB_RUN=speedrun screen -L -Logfile speedrun.log -S speedrun bash speedrun.sh
 
-# Default intermediate artifacts directory is in ~/.cache/nanochat
+# Default intermediate artifacts directory is in /mnt/d/workspace_backup/workspace/ai/nanochat_eng/.cache
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
-mkdir -p $NANOCHAT_BASE_DIR
+export NANOCHAT_BASE_DIR="/mnt/d/workspace_backup/workspace/ai/nanochat_eng/.cache"
+# mkdir -p $NANOCHAT_BASE_DIR
 
 # -----------------------------------------------------------------------------
 # Python venv setup with uv
@@ -66,7 +66,7 @@ python -m nanochat.dataset -n 8
 python -m nanochat.dataset -n 240 &
 DATASET_DOWNLOAD_PID=$!
 # train the tokenizer with vocab size 2**16 = 65536 on ~2B characters of data
-python -m scripts.tok_train --max_chars=2000000000
+python -m scripts.tok_train --max_chars=2000000000 --vocab_size=32000
 # evaluate the tokenizer (report compression ratio etc.)
 python -m scripts.tok_eval
 

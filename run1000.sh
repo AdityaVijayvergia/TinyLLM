@@ -6,7 +6,7 @@
 
 # all the setup stuff
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+export NANOCHAT_BASE_DIR="/mnt/d/workspace_backup/workspace/ai/nanochat_eng/.cache"
 mkdir -p $NANOCHAT_BASE_DIR
 command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 [ -d ".venv" ] || uv venv
