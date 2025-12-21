@@ -9,3 +9,4 @@ eval_bundle/
 .cache/tokenizer_dataset/*
 documentation/gemini_logs/*
 ttst.ipynb
+.cache/reddit_dataset/*

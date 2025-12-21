@@ -5,6 +5,7 @@ from collections import deque
 
 base_dir = "/mnt/d/workspace_backup/workspace/ai/nanochat_eng/.cache"
 TOKENIZER_DATASET_PATH = os.path.join(base_dir, "tokenizer_dataset")
+REDDIT_DATASET_PATH = os.path.join(base_dir, "reddit_dataset")
 
 class FastTextShardWriter:
     def __init__(self, out_dir, shard_size_chars=100_000_000, file_buffer_size=1 << 20):
@@ -97,6 +98,7 @@ class FastTextShardWriter:
 
 
 marker_pattern = re.compile(r'\n_START_ARTICLE_\n|\n_START_PARAGRAPH_\n|\n_START_SECTION_\n|\n_NEWLINE_\n')
+reddit_junk_pattern = re.compile(r"&gt;//#\w+|&gt;``|&gt;`\*.*?\*`|#\w+")
 
 def download_tokenizer_dataset():
 
@@ -118,19 +120,19 @@ def download_tokenizer_dataset():
 
     writer.close()
 
-
-    # try:
-    #     for split in ["test", "validation"]:
-    #         print(f"============split: {split}")
-    #         for x in dataset[split]:
-    #             cleaned_text = marker_pattern.sub(" ", x["text"])
-    #             writer.write(cleaned_text)
-    #             last+=1
-    #             if last % 1000 == 0:
-    #                 print(last)
-
-    # finally:
-    #     writer.close()
-
+def download_reddit_comments_dataset():
+    reddit_commnents_data = load_dataset("sentence-transformers/reddit", streaming=True)
+    writer = FastTextShardWriter(out_dir=REDDIT_DATASET_PATH, shard_size_chars=100_000_000)
+    max_chars = 300_000_000
+    seen_chars = 0
+    for x in reddit_commnents_data["train"]:
+        raw_text = x["title"] + " " + x["body"]
+        cleaned_text = reddit_junk_pattern.sub("", raw_text)
+        writer.write(cleaned_text + "\n")
+        seen_chars += len(cleaned_text)
+        if seen_chars >= max_chars:
+            break
+    writer.close()
 
 download_tokenizer_dataset()
+download_reddit_comments_dataset()
