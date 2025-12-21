@@ -1,59 +1,98 @@
 from datasets import load_dataset, Dataset
 import re
 import os
+from collections import deque
 
 base_dir = "/mnt/d/workspace_backup/workspace/ai/nanochat_eng/.cache"
 TOKENIZER_DATASET_PATH = os.path.join(base_dir, "tokenizer_dataset")
 
-class TextShardWriter:
-    def __init__(self, shard_size_chars=100_000_000):
+class FastTextShardWriter:
+    def __init__(self, out_dir, shard_size_chars=100_000_000, file_buffer_size=1 << 20):
         """
-        shard_size_chars:
-            Approximate number of characters per shard
-            (100M chars ≈ ~100MB)
+        out_dir: directory to write shards
+        shard_size_chars: target chars per shard
+        file_buffer_size: Python file-buffering size in bytes (helps reduce syscalls)
         """
-        
+        self.out_dir = out_dir
+        os.makedirs(out_dir, exist_ok=True)
+
         self.shard_size_chars = shard_size_chars
+        self.file_buffer_size = file_buffer_size
+
         self.shard_idx = 0
+        self.current_chars = 0   # chars already in current shard
         self.file = None
-        self.buffer = ""
+
+        # deque of strings waiting to be written
+        self.chunks = deque()
+        self.buffer_chars = 0    # total chars in chunks deque
 
         self._open_new_shard()
 
     def _open_new_shard(self):
         if self.file:
             self.file.close()
-
-        path = os.path.join(
-            TOKENIZER_DATASET_PATH,
-            f"wiki40b_shard_{self.shard_idx:05d}.txt"
-        )
-        self.file = open(path, "w")
+        path = os.path.join(self.out_dir, f"wiki40b_shard_{self.shard_idx:05d}.txt")
+        # bigger buffering to reduce syscalls
+        self.file = open(path, "w", buffering=self.file_buffer_size)
         self.shard_idx += 1
+        self.current_chars = 0
 
     def write(self, text: str):
+        """
+        Append text to buffer. Write to disk only when we can fill shards.
+        Guarantees no shard exceeds shard_size_chars.
+        """
         if not text:
             return
 
-        text = self.buffer + text
-        self.buffer = ""
-        text_len = len(text)
-        start = 0
-        # print(f"Text length: {text_len}, shard: {self.shard_idx}")
-        while text_len > self.shard_size_chars:
-            print(f"Writing shard {self.shard_idx}")
-            self.file.write(text[start:start + self.shard_size_chars])
-            self._open_new_shard()
-            start += self.shard_size_chars
-            text_len -= self.shard_size_chars
-        
-        self.buffer = text[start:]
+        # append new chunk
+        self.chunks.append(text)
+        self.buffer_chars += len(text)
+
+        # while we have enough to fill current shard, consume exactly what's needed
+        while self.buffer_chars + self.current_chars >= self.shard_size_chars:
+            remaining = self.shard_size_chars - self.current_chars
+            to_write_parts = []
+            written = 0
+
+            # consume chunks until we have 'remaining' characters
+            while remaining > 0 and self.chunks:
+                chunk = self.chunks.popleft()
+                chunk_len = len(chunk)
+                if chunk_len <= remaining:
+                    to_write_parts.append(chunk)
+                    written += chunk_len
+                    remaining -= chunk_len
+                    self.buffer_chars -= chunk_len
+                else:
+                    # partial consume
+                    to_write_parts.append(chunk[:remaining])
+                    # push leftover back to front
+                    leftover = chunk[remaining:]
+                    self.chunks.appendleft(leftover)
+                    written += remaining
+                    self.buffer_chars -= remaining
+                    remaining = 0
+
+            # write joined parts (only the exact amount needed)
+            self.file.write("".join(to_write_parts))
+            self.file.flush()  # optional; can remove for speed, but safer to flush per shard
+            self.current_chars += written
+
+            # current shard full -> rotate
+            if self.current_chars >= self.shard_size_chars:
+                self._open_new_shard()
 
     def close(self):
+        # write any remaining buffered text to the last shard (may be smaller than shard_size_chars)
+        if self.buffer_chars > 0:
+            # write all remaining chunks
+            self.file.write("".join(self.chunks))
+            self.buffer_chars = 0
+            self.chunks.clear()
         if self.file:
-            self.file.write(self.buffer)
             self.file.close()
-            print("Closing file writer")
             self.file = None
 
 
@@ -69,21 +108,29 @@ def download_tokenizer_dataset():
     os.makedirs(TOKENIZER_DATASET_PATH, exist_ok=True)
     dataset = load_dataset("google/wiki40b", "en", split=None, streaming=True)
 
-    writer = TextShardWriter(shard_size_chars=100_000_000)
+    writer = FastTextShardWriter(out_dir=TOKENIZER_DATASET_PATH, shard_size_chars=100_000_000)
 
-    try:
-        last = 0
-        for split in ["test", "validation"]:
-            print(f"============split: {split}")
-            for x in dataset[split]:
-                cleaned_text = marker_pattern.sub(" ", x["text"])
-                writer.write(cleaned_text)
-                last+=1
-                if last % 1000 == 0:
-                    print(last)
+    for split in ["test", "validation"]:
+        for x in dataset[split]:
+            cleaned_text = marker_pattern.sub(" ", x["text"])
+            # optional: add newline between examples to avoid bleed
+            writer.write(cleaned_text + "\n")
 
-    finally:
-        writer.close()
+    writer.close()
+
+
+    # try:
+    #     for split in ["test", "validation"]:
+    #         print(f"============split: {split}")
+    #         for x in dataset[split]:
+    #             cleaned_text = marker_pattern.sub(" ", x["text"])
+    #             writer.write(cleaned_text)
+    #             last+=1
+    #             if last % 1000 == 0:
+    #                 print(last)
+
+    # finally:
+    #     writer.close()
 
 
 download_tokenizer_dataset()

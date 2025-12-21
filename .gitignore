@@ -5,3 +5,7 @@ rustbpe/target/
 dev-ignore/
 report.md
 eval_bundle/
+.cache/header.md
+.cache/tokenizer_dataset/*
+documentation/gemini_logs/*
+ttst.ipynb
