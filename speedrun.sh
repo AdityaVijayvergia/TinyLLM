@@ -75,8 +75,12 @@ python -m scripts.tok_eval
 
 # The d20 model is 561M parameters.
 # Chinchilla says #tokens = 20X #params, so we need 561e6 * 20 = 11.2B tokens.
-# Assume our tokenizer is 4.8 chars/token, this is 11.2B * 4.8 ~= 54B chars.
-# At 250M chars/shard, this is 54B / 250M ~= 216 shards needed for pretraining.
+# Assume our tokenizer -
+  # 32K tokenizer is 4.5 chars/token, this is 11.2B * 4.5 ~= 50B chars.
+  # 64K tokenizer is 4.8 chars/token, this is 11.2B * 4.8 ~= 54B chars.
+# At 250M chars/shard, this is 
+  # 32K - 50B / 250M ~= 200 shards needed for pretraining.
+  # 64K - 54B / 250M ~= 216 shards needed for pretraining.
 # Round up to 240 for safety. At ~100MB/shard, this downloads ~24GB of data to disk.
 # (The total number of shards available in the entire dataset is 1822.)
 echo "Waiting for dataset download to complete..."

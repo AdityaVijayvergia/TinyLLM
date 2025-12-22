@@ -95,3 +95,46 @@ gutenberg  100002   21396   4.67    22157   4.51       -3.6%     GPT-4
 wiki       100174   22023   4.55    22512   4.45       -2.2%     GPT-4     
 reddit     100142   23149   4.33    24703   4.05       -6.7%     GPT-4 
 ```
+
+
+### Pretraining
+
+#### Model Architecture
+
+- Vocab size - ?
+- Head size - 128
+- Number of heads - ?
+- Width (embedding size) - ?
+- Depth - ?
+- max_seq_len (Context window) - 2048 
+
+
+#### Modification Options
+- depth vs number of heads tradeoff for conversation vs world knowledge
+  - Saves vocab_size × n_embd parameters (~82M for 64K × 1280)
+  - In gpt.py: Use self.lm_head.weight = self.transformer.wte.weight
+  - Optimizer impact: The tied weights need a single optimizer group (likely AdamW, not separate embedding_lr/unembedding_lr)
+- MLP hidden dimension size tradeoff. Can it be reduced to 3 × n_embd or even 2.5 × n_embd
+  - Currently: 4 × n_embd expansion (line 115-116)
+    - self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+  - Option: Reduce to 3 × n_embd or even 2.5 × n_embd
+    - Saves ~25-40% of MLP parameters (MLP is ~2/3 of model params)
+    - Trade-off: Reduced expressivity, but for conversation vs. world knowledge, this may be acceptable
+- Reduce Context Length (max_seq_len)
+  - Currently: 2048 tokens
+  - For conversational focus, you likely don't need long context:
+    - 1024 saves 50% attention memory → allows larger batches
+    - 512 for very short exchanges (but may hurt coherence)
+  - Impact: Reduces rotary_seq_len and attention FLOPs quadratically
+- Activation Function
+  - Currently uses relu^2 (squared ReLU):
+    - x = F.relu(x).square()  # line 120
+    - Alternative: Standard GELU or SiLU/Swish
+  - relu^2 is good for sparsity but may not be critical for conversation
+  - GELU is more common and well-understood
+- Group-Query Attention (GQA)
+  - Currently: n_kv_head = n_head (1:1, GQA disabled)
+  - Option: Set n_kv_head = n_head // 4 or n_head // 2
+    - Saves ~50-75% of K/V projection parameters per layer
+    - Also saves KV cache memory during inference
+    - Popular in Llama 2/3, Gemma
