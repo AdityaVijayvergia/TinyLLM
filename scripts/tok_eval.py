@@ -175,11 +175,13 @@ def get_custom_text(shard_idx):
         text = f.read(100_000)
     return text, filepath
 
-train_text, train_filepath = get_custom_text(0)
-val_text, val_filepath = get_custom_text(-1)
+gutenberg_text, gutenberg_filepath = get_custom_text(0)
+wiki_text, wiki_filepath = get_custom_text(-1)
+reddit_text, reddit_filepath = get_custom_text(10)
 
-print("train_filepath", train_filepath)
-print("val_filepath", val_filepath)
+print("gutenberg_filepath", gutenberg_filepath)
+print("wiki_filepath", wiki_filepath)
+print("reddit_filepath", reddit_filepath)
 
 all_text = [
     ("english", news_text),
@@ -187,8 +189,9 @@ all_text = [
     ("code", code_text),
     ("math", math_text),
     ("science", science_text),
-    ("reddit", train_text),
-    ("wiki", val_text),
+    ("gutenberg", gutenberg_text),
+    ("wiki", wiki_text),
+    ("reddit", reddit_text),
 ]
 
 # Try out current default compared to GPT-2 and GPT-4 tokenizers
