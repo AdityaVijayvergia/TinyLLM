@@ -1,4 +1,4 @@
-# nanochat - Package Documentation
+# nanochat - Package Documentation & Implementation Plan
 
 ## 1. Overview
 **nanochat** is a minimalist, full-stack implementation of a Large Language Model (LLM) similar to ChatGPT. It is designed to be hackable, clean, and dependency-light, capable of running on a single 8xH100 node for training or on CPU/MPS for inference.
@@ -59,7 +59,7 @@ The `rustbpe` crate handles efficient BPE tokenization.
     - `speedrun.sh`: Trains a "d20" model in ~4 hours ($100 tier).
     - `run1000.sh`: Trains a "d32" model ($800 tier).
 
-## 4. Key Workflows
+## 4. Key Workflows (Standard)
 
 ### 4.1 Inference (Generation)
 Inference is handled by `nanochat.engine.Engine`.
@@ -70,52 +70,78 @@ Inference is handled by `nanochat.engine.Engine`.
     -   **Sampling**: Uses temperature and top-k sampling.
     -   **Tools**: Can detect `<|python_start|>` tokens to execute Python code (calculator).
 
-### 4.2 Training
+### 4.2 Training Pipeline
 Training is orchestrated via shell scripts calling python modules (e.g., `scripts.base_train`).
 -   **Distributed**: Uses `torchrun` for multi-GPU support.
 -   **Gradient Accumulation**: Automatically adjusts if running on fewer GPUs.
 -   **Mixed Precision**: Uses `bfloat16`.
 
-## 5. Directory Structure Summary
-```
-nanochat_eng/
-├── nanochat/          # Main Python package
-│   ├── gpt.py         # Model definition
-│   ├── engine.py      # Inference engine
-│   └── ...
-├── rustbpe/           # Rust tokenizer extension
-├── scripts/           # Training and evaluation scripts
-├── tasks/             # Task definitions for evaluation
-├── dev/               # Development utilities
-├── tests/             # Tests (pytest)
-├── pyproject.toml     # Python config
-└── Cargo.toml         # Rust config (inside rustbpe)
-```
+**Standard Stages**:
+1.  **Pretraining**: ~3 hours (d20), trains on FineWeb-EDU shards. Scaling law: ~20x params.
+2.  **Midtraining**: ~8 mins, adapts to conversation format, special tokens, and multiple choice (MMLU).
+3.  **SFT**: ~7 mins, cherry-picked data, individual row padding for domain adaptation.
+4.  **RL (Optional)**: GRPO on GSM8K.
 
-## 6. Deep Dive: Implementation Details
+---
 
-### 6.1 Data Pipeline
-The data pipeline is designed for massive scale and distributed training.
--   **Storage**: Data is stored as Parquet files (shards) in `base_data/`.
--   **Downloading**: `nanochat.dataset.download_single_file` fetches shards from HuggingFace on demand.
--   **Loading**: `nanochat.dataloader.tokenizing_distributed_data_loader_with_state` is the core generator.
-    -   **Distributed**: Each DDP rank reads a subset of row groups from the Parquet files to avoid overlap.
-    -   **Tokenization**: Happens on-the-fly using the tokenizer.
-    -   **Resumption**: It yields a `state_dict` containing (`pq_idx`, `rg_idx`) to allow approximate resumption of training without re-consuming seen data.
-    -   **Performance**: Uses `pin_memory` and `non_blocking` transfers to GPU.
+## 5. User Customization Plan: General English Conversation Model
 
-### 6.2 Custom Optimizers (Muon)
-`nanochat` uses a hybrid optimization strategy defined in `gpt.GPT.setup_optimizers`:
--   **AdamW**: Used for embeddings and the final language model head.
--   **Muon**: Used for internal 2D linear layers (matrix parameters).
-    -   **Concept**: MomentUm Orthogonalized by Newton-schulz. Optimizes matrices by maintaining their spectral norm ~1.
-    -   **Implementation**: `nanochat.muon.DistMuon` handles its own distributed synchronization. It uses `reduce_scatter` to average gradients and `all_gather` to sync updated weights, optimizing communication for these large matrices.
-    -   **Newton-Schulz**: Uses a quintic iteration to strictly orthogonalize updates.
+### 5.1 Project Goal
+To build a high-quality "General English Chat Model" without specific focus on coding, math, or deep world knowledge. The model should maintain coherent, natural conversation.
 
-### 6.3 Tokenizer Implementation
-The project uses a dual-backend approach for tokenization:
--   **Training (`rustbpe`)**: A custom Rust extension (`rustbpe.Tokenizer`) handles high-performance BPE training.
-    -   **Parallelism**: Uses `rayon` for parallel text processing.
-    -   **Algorithm**: Standard BPE with GPT-4's split pattern.
--   **Inference (`tiktoken`)**: A Python wrapper `nanochat.tokenizer.RustBPETokenizer` loads the trained vocabulary into `tiktoken` for extremely fast inference.
--   **Chat Formatting**: `render_conversation` handles converting chat messages (User/Assistant) into token IDs with appropriate masking (training only on Assistant outputs).
+### 5.2 Constraints
+-   **Budget**: ~10-12 hours of 8xH100 compute (approx $300-$400 equivalent).
+-   **Data**: English-focused (Wikipedia, Books, Reddit).
+-   **Task**: Pure conversation.
+
+### 5.3 Custom Data
+-   **Tokenizer**: Custom BPE tokenizer already trained.
+    -   **Vocabulary**: 64K size.
+    -   **Data Split**: 45% Wikipedia, 40% Books, 15% Reddit.
+    -   **Performance**: 5.1 average character length.
+
+### 5.4 Proposed Architecture Modifications
+To optimize for the conversational goal and budget, the following architectural changes are planned to reduce parameter count and computational cost while preserving conversational capability.
+
+#### A. Weight Tying (Embeddings)
+-   **Change**: Tie the weights of the token embedding layer (`wte`) and the language model head (`lm_head`).
+-   **Impact**:
+    -   Saves `vocab_size * n_embd` parameters (approx. 82M parameters for a d20 model with 64K vocab).
+    -   Reduces memory footprint significantly.
+-   **Implementation**: modify `gpt.py` to share the weight tensor, update `setup_optimizers` to handle single parameter group.
+
+#### B. Context Length Reduction
+-   **Change**: Reduce `max_seq_len` from **2048** to **1024** (or potentially **512**).
+-   **Rationale**: General conversation rarely requires massive context windows compared to document analysis or coding.
+-   **Impact**:
+    -   Reduces memory usage (KV cache).
+    -   Reduces Attention mechanism complexity (quadratic scaling).
+    -   Allows for larger batch sizes, speeding up training.
+
+#### C. MLP Dimension Reduction
+-   **Change**: Reduce the MLP expansion factor from the standard **4x** to **3x** or **2.5x**.
+-   **Current**: `n_embd -> 4 * n_embd -> n_embd`
+-   **Impact**:
+    -   MLP layers constitute ~2/3 of total parameters.
+    -   Reducing to 3x saves ~17% of MLP parameters (~100M params).
+    -   Trade-off: Slight reduction in expressivity/memorization, acceptable for conversational focus.
+
+#### D. Group-Query Attention (GQA) Tuning
+-   **Change**: Set `n_kv_head` to `n_head // 4` (instead of 1:1 or 1:2).
+-   **Impact**:
+    -   Significantly reduces Key/Value projection parameters.
+    -   Lowers inference memory usage (KV Cache).
+    -   Standard practice in modern models (Llama 2/3, Gemma).
+
+#### E. Activation Function
+-   **Change**: Switch from `relu^2` (squared ReLU) to **GELU** or **SiLU**.
+-   **Rationale**: GELU is the standard for modern LLMs (GPT-series, Llama, etc.) and offers smoother gradients. `relu^2` was likely chosen for specific sparsity properties which might not be the priority here.
+
+#### F. Other Optimizations
+-   **Logit Softcap**: Evaluate modifying or removing the `softcap=15` applied to logits (Gemma-style regularization).
+-   **Rotary Embeddings**: Ensure `base` theta is sufficient (e.g., 100k) if context length remains high, otherwise standard is fine.
+
+### 5.5 Execution Roadmap
+1.  **Architecture Update**: Modify `nanochat/gpt.py` to implement the above changes (Weight tying, GQA, MLP ratio).
+2.  **Config Update**: Adjust `scripts/base_train.py` and `configurator.py` to support new hyperparameters.
+3.  **Training**: Run the training pipeline on the custom tokenizer and English dataset within the allocated 12-hour compute budget.
