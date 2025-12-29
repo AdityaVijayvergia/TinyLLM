@@ -11,3 +11,4 @@ documentation/gemini_logs/*
 ttst*
 .cache/reddit_dataset/*
 .cache/gutenberg_dataset/*
+.cache/tokenizer/*
