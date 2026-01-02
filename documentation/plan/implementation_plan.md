@@ -12,7 +12,7 @@
     - Options 2 - 50% Wikipedia + 30% Books Corpus + 20% news or conversational text
 - Datasets - not curating new tokenizer dataset. It is a solved problem with many freely available datasets.
 - Vocab size - 32K
-
+- Tested other tokenizers with small vocab size - `mistralai/Mistral-7B-v0.1` and `NousResearch/Llama-2-7b-hf`. Both have lower performance compared to our 32K tokenizer.
 
 #### Tokenizer training results
 - Option 2 had better performance
@@ -110,31 +110,45 @@ reddit     100142   23149   4.33    24703   4.05       -6.7%     GPT-4
 
 
 #### Modification Options
-- depth vs number of heads tradeoff for conversation vs world knowledge
+1. Depth vs number of heads tradeoff for conversation vs world knowledge
+2. Weight Tying between embedding model and LM_Head
   - Saves vocab_size × n_embd parameters (~82M for 64K × 1280)
   - In gpt.py: Use self.lm_head.weight = self.transformer.wte.weight
   - Optimizer impact: The tied weights need a single optimizer group (likely AdamW, not separate embedding_lr/unembedding_lr)
-- MLP hidden dimension size tradeoff. Can it be reduced to 3 × n_embd or even 2.5 × n_embd
+3. MLP hidden dimension size tradeoff. Can it be reduced to 3 × n_embd or even 2.5 × n_embd
   - Currently: 4 × n_embd expansion (line 115-116)
     - self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
   - Option: Reduce to 3 × n_embd or even 2.5 × n_embd
     - Saves ~25-40% of MLP parameters (MLP is ~2/3 of model params)
     - Trade-off: Reduced expressivity, but for conversation vs. world knowledge, this may be acceptable
-- Reduce Context Length (max_seq_len)
+4. Reduce Context Length (max_seq_len)
   - Currently: 2048 tokens
   - For conversational focus, you likely don't need long context:
     - 1024 saves 50% attention memory → allows larger batches
     - 512 for very short exchanges (but may hurt coherence)
   - Impact: Reduces rotary_seq_len and attention FLOPs quadratically
-- Activation Function
+5. Activation Function
   - Currently uses relu^2 (squared ReLU):
     - x = F.relu(x).square()  # line 120
     - Alternative: Standard GELU or SiLU/Swish
   - relu^2 is good for sparsity but may not be critical for conversation
   - GELU is more common and well-understood
-- Group-Query Attention (GQA)
+6. Group-Query Attention (GQA)
   - Currently: n_kv_head = n_head (1:1, GQA disabled)
   - Option: Set n_kv_head = n_head // 4 or n_head // 2
     - Saves ~50-75% of K/V projection parameters per layer
     - Also saves KV cache memory during inference
     - Popular in Llama 2/3, Gemma
+
+
+### Implementation
+- Goal is to write a simple training script that runs on a single A10 GPU. I will use the Huggingface transformers library to make it easier to implement.
+
+#### Data Preprocessing
+- I will be renting the GPU so I try to minimize any delay where GPU is idle and waiting for I/O operations.
+- Streaming data from the dataset is wasteful as it redowsnloads the data if the training goes over the dataset multiple time. So I will be downloading the dataset and storing it in a local directory.
+- The data needs to be tokenized and made into batches of fixed length (context window of the model). I will preprocess the data - including tokenization and batching - and load this data into the GPU for training. This way GPU can just read the numbers instead of doing any string processing
+- Oracle compute is using HDD. It hates jumping around (random access). It loves reading continuously. Crucial Tip: When we create .bin file in prepare_dataset.py, shuffle the text chunks before writing them.
+  - If the file is validly shuffled on disk, dataloader just reads 0...100MB...200MB sequentially.
+  - This is the "happy path" for an HDD.
+  - If we don't shuffle offline, and try to pick random indices dataset[random_index] during training, the HDD head will thrash and it will be slow.
