@@ -9,9 +9,16 @@ torchrun --nproc_per_node=8 base_train.py
 
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
 python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 --eval_tokens=512 --core_metric_every=-1 --total_batch_size=512 --num_iterations=20
+
+DETAILED EDUCATIONAL EXPLANATION:
+This script is the main training entry point. It orchestrates the entire training process:
+1. Setup: initializes distributed training (DDP), creates the model, optimizer, and data loaders.
+2. Loop: Runs the training loop (forward pass -> loss -> backward pass -> optimizer step).
+3. Maintenance: periodically evaluates the model, saves checkpoints, and logs metrics to WandB.
 """
 
 import os
+# Set allocator config to avoid memory fragmentation on GPU
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
 from contextlib import nullcontext
@@ -28,50 +35,66 @@ from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
 print_banner()
-
+ 
 # -----------------------------------------------------------------------------
 # User settings
+# These are default values. They can be overridden via command line arguments.
+# e.g., --depth=24 will update the 'depth' variable below.
+
 run = "dummy" # wandb run name default ("dummy" is special - we won't log to wandb)
 # Runtime
 device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
+
 # Model architecture
+# We use a simple scaling rule: "width" and "heads" are derived from "depth".
 depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
-max_seq_len = 2048 # max context length
+max_seq_len = 2048 # max context length: how far back the model can see.
+
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
 target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
+
 # Optimization
-device_batch_size = 32 # per-device batch size (set to not OOM)
-total_batch_size = 524288 # total desired batch size, in #tokens
+device_batch_size = 32 # per-device batch size (set to not OOM). This is how many sequences fit on ONE GPU.
+total_batch_size = 524288 # total desired batch size, in #tokens. This is the mathematical batch size for optimization.
+# If total_batch_size > (device_batch_size * num_gpus * seq_len), we use Gradient Accumulation.
+
 embedding_lr = 0.2 # learning rate for the embedding parameters (Adam)
 unembedding_lr = 0.004 # learning rate for the unembedding parameters (Adam)
 weight_decay = 0.0 # weight decay for the embedding/unembedding parameters (Adam)
-matrix_lr = 0.02 # learning rate for the matrix parameters (Muon)
-grad_clip = 1.0 # gradient clipping value (0.0 = disabled)
-warmup_ratio = 0.0 # ratio of iterations for LR warmup
-warmdown_ratio = 0.2 # ratio of iterations for LR warmdown
+matrix_lr = 0.02 # learning rate for the matrix parameters (Muon) - Muon needs different LR scaling than Adam
+
+grad_clip = 1.0 # gradient clipping value (0.0 = disabled): prevents gradient explosions
+warmup_ratio = 0.0 # ratio of iterations for LR warmup: start slow then ramp up
+warmdown_ratio = 0.2 # ratio of iterations for LR warmdown: cosine decay at the end
 final_lr_frac = 0.0 # final LR is this fraction of the initial LR
 resume_from_step = -1 # resume training from this step of the optimization (-1 = disable)
-# Evaluation
-eval_every = 250 # every how many steps to evaluate the model for val bpb
+
+# Evaluation - monitoring progress
+eval_every = 250 # every how many steps to evaluate the model for val bpb (bits per byte)
 eval_tokens = 20*524288 # number of tokens to evaluate val loss on
 core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 = disable)
 core_metric_max_per_task = 500 # examples per task in estimating the core metric
-sample_every = 2000 # every how many steps to sample from the model
+sample_every = 2000 # every how many steps to sample from the model (generate text)
 save_every = -1 # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
+
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
-# now allow CLI to override the settings via the configurator lol
+
+# now allow CLI to override the settings via the configurator
+# This block allows passing arguments like `python base_train.py --depth=12`
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
 user_config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
 # Compute init
+# Sets up Distributed Data Parallel (DDP) if we are using multiple GPUs
 device_type = autodetect_device_type() if device_type == "" else device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+# Mixed Precision Setup: Use bfloat16 for matrix multiplications on CUDA to save memory & speed up
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
@@ -87,7 +110,9 @@ vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
 # Model kwargs are derived from the desired depth of the model
+# As explained in model_architecture.md, we derive width/heads from depth to keep aspect ratio.
 num_layers = depth
+# model_dim = width of the model = n_embd
 model_dim = depth * 64 # aspect ratio 64 (usually this is varied from 64 -> 128 as model size increases)
 num_heads = max(1, (model_dim + 127) // 128) # head dim 128 (the division here is ceil div)
 num_kv_heads = num_heads # default is 1:1 GQA (Group Query Attention) ratio (i.e. GQA is disabled)
@@ -101,6 +126,8 @@ print0(f"num_kv_heads: {num_kv_heads}")
 tokens_per_fwdbwd = device_batch_size * max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
 assert total_batch_size % world_tokens_per_fwdbwd == 0
+# Gradient Accumulation: If our batch size is too big for GPU memory, we simulate it by adding up 
+# gradients over multiple small steps before updating weights.
 grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {device_batch_size} x {max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
@@ -111,6 +138,7 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 
 # Create a new model with random weights
 model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+# Init on "meta" device first to not allocate memory immediately (faster init)
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
     model = GPT(model_config)
@@ -129,6 +157,7 @@ if resuming:
     del model_data # free up this memory after the copy
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
+# torch.compile: optimizing the model execution graph (JIT compilation)
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
@@ -167,6 +196,7 @@ if resuming:
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
+# Uses our custom streaming dataloader that reads tokens from disk
 tokens_dir = os.path.join(base_dir, "tokenized_data")
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 train_loader = tokenizing_distributed_data_loader_with_state(device_batch_size, max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
@@ -176,7 +206,7 @@ x, y, dataloader_state_dict = next(train_loader) # kick off load of the very fir
 # -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
 
-# Learning rate scheduler
+# Learning rate scheduler (Warmup -> Constant -> Warmdown/Cos Decay)
 def get_lr_multiplier(it):
     warmup_iters = round(warmup_ratio * num_iterations)
     warmdown_iters = round(warmdown_ratio * num_iterations)
@@ -188,7 +218,7 @@ def get_lr_multiplier(it):
         progress = (num_iterations - it) / warmdown_iters
         return progress * 1.0 + (1 - progress) * final_lr_frac
 
-# Momentum scheduler for Muon optimizer
+# Momentum scheduler for Muon optimizer (Ramps up momentum over time)
 def get_muon_momentum(it):
     frac = min(it / 300, 1)
     momentum = (1 - frac) * 0.85 + frac * 0.95
@@ -301,16 +331,21 @@ while True:
 
     # -------------------------------------------------------------------------
     # single training step
-    # evaluate the gradient
+    # -------------------------------------------------------------------------
+    
+    # 1. Forward/Backward
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            loss = model(x, y) # Forward pass
         train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        loss = loss / grad_accum_steps # scale loss because gradients sum up
+        loss.backward() # Backward pass (compute gradients)
+        # Prefetch the next batch while the GPU is busy with forward/backward
+        x, y, dataloader_state_dict = next(train_loader) 
+        
+    # 2. Optimization Step
     # gradient clipping
     grad_clip_enabled = grad_clip > 0.0
     if grad_clip_enabled:
@@ -325,8 +360,9 @@ while True:
     for group in muon_optimizer.param_groups:
         group["momentum"] = muon_momentum
     for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
+        opt.step() # Update weights
+    model.zero_grad(set_to_none=True) # Flush gradients
+    
     synchronize()
     t1 = time.time()
     dt = t1 - t0
