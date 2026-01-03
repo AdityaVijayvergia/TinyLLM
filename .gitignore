@@ -5,10 +5,6 @@ rustbpe/target/
 dev-ignore/
 report.md
 eval_bundle/
-.cache/header.md
-.cache/tokenizer_dataset/*
 documentation/gemini_logs/*
 ttst*
-.cache/reddit_dataset/*
-.cache/gutenberg_dataset/*
-.cache/tokenizer/*
+.cache/*
