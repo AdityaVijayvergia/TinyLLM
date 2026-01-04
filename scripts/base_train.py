@@ -3,19 +3,17 @@ Train model. Run as:
 
 python base_train.py
 
-or distributed as:
-
-torchrun --nproc_per_node=8 base_train.py
-
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
 python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 --eval_tokens=512 --core_metric_every=-1 --total_batch_size=512 --num_iterations=20
 
 DETAILED EDUCATIONAL EXPLANATION:
 This script is the main training entry point. It orchestrates the entire training process:
-1. Setup: initializes distributed training (DDP), creates the model, optimizer, and data loaders.
+1. Setup: creates the model, optimizer, and data loaders.
 2. Loop: Runs the training loop (forward pass -> loss -> backward pass -> optimizer step).
 3. Maintenance: periodically evaluates the model, saves checkpoints, and logs metrics to WandB.
 """
+
+print("starting imports")
 
 import os
 # Set allocator config to avoid memory fragmentation on GPU
@@ -35,7 +33,14 @@ from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
 print_banner()
- 
+
+print("done imports")
+
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
+
 # -----------------------------------------------------------------------------
 # User settings
 # These are default values. They can be overridden via command line arguments.
@@ -47,8 +52,8 @@ device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, i
 
 # Model architecture
 # We use a simple scaling rule: "width" and "heads" are derived from "depth".
-depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
-max_seq_len = 2048 # max context length: how far back the model can see.
+depth = 4 # TODO: change to 24 when training full model
+max_seq_len = 256 # TODO: change to 1024 when training full model
 
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
@@ -56,8 +61,12 @@ target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for
 target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
 
 # Optimization
-device_batch_size = 32 # per-device batch size (set to not OOM). This is how many sequences fit on ONE GPU.
-total_batch_size = 524288 # total desired batch size, in #tokens. This is the mathematical batch size for optimization.
+#  To be changed for A10. 
+# TPU batch size is 32
+# TODO: Increase before training
+device_batch_size = 32 # per-device batch size (set to not OOM). This is how many sequences fit on ONE GPU. 
+total_batch_size = 10240 # total desired batch size, in #tokens. This is the mathematical batch size for optimization.
+# total_batch_size = 524288 # total desired batch size, in #tokens. This is the mathematical batch size for optimization.
 # If total_batch_size > (device_batch_size * num_gpus * seq_len), we use Gradient Accumulation.
 
 embedding_lr = 0.2 # learning rate for the embedding parameters (Adam)
@@ -69,38 +78,40 @@ grad_clip = 1.0 # gradient clipping value (0.0 = disabled): prevents gradient ex
 warmup_ratio = 0.0 # ratio of iterations for LR warmup: start slow then ramp up
 warmdown_ratio = 0.2 # ratio of iterations for LR warmdown: cosine decay at the end
 final_lr_frac = 0.0 # final LR is this fraction of the initial LR
+
+# Resume training
 resume_from_step = -1 # resume training from this step of the optimization (-1 = disable)
 
 # Evaluation - monitoring progress
-eval_every = 250 # every how many steps to evaluate the model for val bpb (bits per byte)
-eval_tokens = 20*524288 # number of tokens to evaluate val loss on
-core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 = disable)
-core_metric_max_per_task = 500 # examples per task in estimating the core metric
-sample_every = 2000 # every how many steps to sample from the model (generate text)
-save_every = -1 # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
+# TODO: increase for training
+eval_every = 100 # every how many steps to evaluate the model for val bpb (bits per byte)
+eval_tokens = 20*total_batch_size # number of tokens to evaluate val loss on
+core_metric_every = 200 # every how many steps to evaluate the core metric (-1 = disable)
+core_metric_max_per_task = 100 # examples per task in estimating the core metric
+sample_every = core_metric_every # every how many steps to sample from the model (generate text)
+save_every = 500 # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
 
 # Output
-model_tag = "" # optionally override the model tag for the output checkpoint directory name
+model_tag = "test" # optionally override the model tag for the output checkpoint directory name
 
 # now allow CLI to override the settings via the configurator
 # This block allows passing arguments like `python base_train.py --depth=12`
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
+# exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
 user_config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
 # Compute init
-# Sets up Distributed Data Parallel (DDP) if we are using multiple GPUs
 device_type = autodetect_device_type() if device_type == "" else device_type
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+device = torch.device(device_type)
+
 # Mixed Precision Setup: Use bfloat16 for matrix multiplications on CUDA to save memory & speed up
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 
 # wandb logging init
-use_dummy_wandb = run == "dummy" or not master_process
+use_dummy_wandb = run == "dummy"
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=run, config=user_config)
 
 # Tokenizer will be useful for evaluation, also we need the vocab size
@@ -112,9 +123,9 @@ print0(f"Vocab size: {vocab_size:,}")
 # Model kwargs are derived from the desired depth of the model
 # As explained in model_architecture.md, we derive width/heads from depth to keep aspect ratio.
 num_layers = depth
-# model_dim = width of the model = n_embd
-model_dim = depth * 64 # aspect ratio 64 (usually this is varied from 64 -> 128 as model size increases)
-num_heads = max(1, (model_dim + 127) // 128) # head dim 128 (the division here is ceil div)
+# model_dim = width of the model = n_embd = hidden size
+model_dim = 1024
+num_heads = 8
 num_kv_heads = num_heads # default is 1:1 GQA (Group Query Attention) ratio (i.e. GQA is disabled)
 print0(f"num_layers: {num_layers}")
 print0(f"model_dim: {model_dim}")
@@ -123,14 +134,11 @@ print0(f"num_kv_heads: {num_kv_heads}")
 
 # Optimizer / data / training length related hyperparameters
 # figure out the needed gradient accumulation to reach the desired total batch size
-tokens_per_fwdbwd = device_batch_size * max_seq_len # tokens per iteration for a single rank
-world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
-assert total_batch_size % world_tokens_per_fwdbwd == 0
+tokens_per_fwdbwd = device_batch_size * max_seq_len # tokens per iteration to be loaded into GPU memory
 # Gradient Accumulation: If our batch size is too big for GPU memory, we simulate it by adding up 
 # gradients over multiple small steps before updating weights.
-grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
-print0(f"Tokens / micro-batch / rank: {device_batch_size} x {max_seq_len} = {tokens_per_fwdbwd:,}")
-print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
+grad_accum_steps = total_batch_size // tokens_per_fwdbwd
+print0(f"Tokens / micro-batch: {device_batch_size} x {max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
 # -----------------------------------------------------------------------------
@@ -142,8 +150,11 @@ model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_la
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
     model = GPT(model_config)
-model.to_empty(device=device)
-model.init_weights()
+model.to_empty(device=device) # All tensors get storage on target device but with uninitialized (garbage) data
+model.init_weights() # All tensors get initialized
+
+print("Model:")
+print(model)
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -152,7 +163,7 @@ checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, resume_from_step, device, load_optimizer=True)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -164,25 +175,10 @@ print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-# Calculate number of iterations. Either it is given, or from target flops, or from target data:param ratio (in that order)
-assert num_iterations > 0 or target_param_data_ratio > 0 or target_flops > 0
-if num_iterations > 0:
-    print0(f"Using user-provided number of iterations: {num_iterations:,}")
-elif target_flops > 0:
-    # calculate the number of iterations from the target flops
-    num_iterations = round(target_flops / (num_flops_per_token * total_batch_size))
-    print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
-elif target_param_data_ratio > 0:
-    # calculate the number of iterations from the target param data ratio
-    target_tokens = target_param_data_ratio * num_params
-    num_iterations = target_tokens // total_batch_size
-    print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
-else:
-    raise ValueError("No training horizon specified")
-total_tokens = total_batch_size * num_iterations
-print0(f"Total number of training tokens: {total_tokens:,}")
-print0(f"Tokens : Params ratio: {total_batch_size * num_iterations / num_params:.2f}") # Chinchilla is ~20
-print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+# calculate the number of iterations from the target param data ratio
+target_tokens = target_param_data_ratio * num_params
+num_iterations = target_tokens // total_batch_size
+print0(f"Calculated number of iterations: {num_iterations:,}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
@@ -241,6 +237,10 @@ else:
     total_training_time = loop_state["total_training_time"]
 
 # -----------------------------------------------------------------------------
+
+print("starting training")
+
+
 # Training loop
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -250,7 +250,7 @@ while True:
     if last_step or step % eval_every == 0:
         model.eval()
         val_loader = build_val_loader()
-        eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
+        eval_steps = eval_tokens // (device_batch_size * max_seq_len)
         with autocast_ctx:
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
@@ -282,7 +282,7 @@ while True:
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
-    if master_process and (last_step or (step > 0 and step % sample_every == 0)):
+    if last_step or (step > 0 and step % sample_every == 0):
         model.eval()
         prompts = [
             "The capital of France is",
@@ -322,7 +322,6 @@ while True:
                     "total_training_time": total_training_time,
                 },
             },
-            rank=ddp_rank,
         )
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
@@ -412,9 +411,8 @@ get_report().log(section="Base model training", data=[
         "Number of parameters": num_params,
         "Number of FLOPs per token": f"{num_flops_per_token:e}",
         "Calculated number of iterations": num_iterations,
-        "Number of training tokens": total_tokens,
+        "Number of training tokens": target_tokens,
         "Tokens : Params ratio": total_batch_size * num_iterations / num_params,
-        "DDP world size": ddp_world_size,
         "warmup_ratio": warmup_ratio,
         "warmdown_ratio": warmdown_ratio,
         "final_lr_frac": final_lr_frac,

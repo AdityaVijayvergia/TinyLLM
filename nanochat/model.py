@@ -50,6 +50,7 @@ class GPTConfig:
     mlp_ratio: int = 3
     vocab_size: int = 32*1024
     sequence_len: int = 1024
+    n_kv_head: int = 8
 
 
 def norm(x):
@@ -212,12 +213,13 @@ class GPT(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.config = config
+        self.max_seq_len = config.sequence_len
         self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_dim)
         self.blocks = nn.ModuleList([TransformerBlock(config, layer_idx) for layer_idx in range(config.n_layers)])
         self.lm_head = nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
         self.lm_head.weight = self.token_embedding.weight
 
-        self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute
+        self.rotary_seq_len = config.sequence_len * 20 # 10X over-compute
         # Why 10x? This provides a generous buffer for inference/generation, allowing the model
         # to generate sequences longer than its training length without recomputing embeddings.
         # Note: While the embeddings support 10x length, the model's quality degrades beyond ~1.5-2x
@@ -298,7 +300,12 @@ class GPT(nn.Module):
            - Why: Ensures strong initial signal strength before it enters the first normalization layer.
         """
         # Embedding
-        torch.nn.init.normal_(self.token_embedding.weight, mean=0.0, std=1.0)
+        # torch.nn.init.normal_(self.token_embedding.weight, mean=0.0, std=1.0)
+        std = 1.0 / math.sqrt(config.hidden_dim)  # ≈ 0.031 for hidden_dim=1024
+        torch.nn.init.normal_(self.token_embedding.weight, mean=0.0, std=std)
+
+        # TODO: Also try Xavier/Glorot Initialization
+        # torch.nn.init.xavier_uniform_(self.token_embedding.weight)
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.hidden_dim
@@ -321,6 +328,7 @@ class GPT(nn.Module):
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
         if self.token_embedding.weight.device.type == "cuda":
             self.token_embedding.to(dtype=torch.bfloat16)
+            self.lm_head.weight = self.token_embedding.weight
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # autodetect the device from model embeddings
@@ -374,6 +382,8 @@ class GPT(nn.Module):
         # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
         matrix_params = list(self.blocks.parameters())
         embedding_params = list(self.token_embedding.parameters())
+        print(f"matrix parameters: {len(matrix_params)}, embedding parameters: {len(embedding_params)}, total parameters: {len(list(self.parameters()))}")
+        print(f"len(matrix_params) + len(embedding_params): {len(matrix_params) + len(embedding_params)}")
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params)
 
         # Create the AdamW optimizer for the embedding
