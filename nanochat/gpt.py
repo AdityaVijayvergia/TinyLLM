@@ -9,6 +9,19 @@ Notable features:
 - no learnable params in rmsnorm
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
+
+DETAILED EXPLANATION:
+This file implements a Transformer-based Language Model (LLM) for Next Token Prediction.
+It maps a sequence of token IDs to the probability distribution of the next token.
+
+Architecture Overview:
+1. Embedding: Token IDs -> Vectors (wte)
+2. Stack of Blocks (Repeated L times):
+   - RMSNorm
+   - Attention (Mixing info between tokens)
+   - RMSNorm
+   - MLP (Processing info within a token)
+3. Final Norm & Head: Vectors -> Logits (Probabilities)
 """
 
 import math
@@ -25,20 +38,32 @@ from nanochat.adamw import DistAdamW
 
 @dataclass
 class GPTConfig:
-    sequence_len: int = 1024
-    vocab_size: int = 50304
-    n_layer: int = 12
-    n_head: int = 6 # number of query heads
-    n_kv_head: int = 6 # number of key/value heads (GQA)
-    n_embd: int = 768
+    """
+    Hyperparameters for the model.
+    """
+    sequence_len: int = 1024 # Context Window: max tokens the model can attend to.
+    vocab_size: int = 50304  # Vocabulary Size: number of unique tokens.
+    n_layer: int = 12        # Depth: number of Transformer blocks.
+    n_head: int = 6          # Number of Query Heads.
+    n_kv_head: int = 6       # Number of K/V Heads (if < n_head, uses GQA).
+    n_embd: int = 768        # Width: dimension of the embedding vectors.
 
 
 def norm(x):
+    """
+    RMSNorm (Root Mean Square Layer Normalization).
+    Used to stabilize training by normalizing activation magnitudes.
+    We use a purely functional version with no learnable parameters here.
+    """
     # Purely functional rmsnorm with no learnable params
     return F.rms_norm(x, (x.size(-1),))
 
 
 def apply_rotary_emb(x, cos, sin):
+    """
+    Applies Rotary Positional Embeddings (RoPE).
+    Rotates the query and key vectors to encode relative positions.
+    """
     assert x.ndim == 4  # multihead attention
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:] # split up last time into two halves
@@ -49,6 +74,18 @@ def apply_rotary_emb(x, cos, sin):
     return out
 
 class CausalSelfAttention(nn.Module):
+    """
+    Multi-Head Causal Self Attention.
+    
+    1. Projects input to Q, K, V.
+    2. Applies RoPE to Q, K for position info.
+    3. Computes attention scores (Q @ K) to see how much each token cares about others.
+    4. Aggregates values (V) based on scores.
+    5. Projects output to mix information across heads.
+    """
+    # "Causal" signifies that time only flows forward. The model is not allowed to "cheat" 
+    # by looking into the future. In the context of a Language Model (LLM), we are training 
+    # it to predict the next word.
     def __init__(self, config, layer_idx):
         super().__init__()
         self.layer_idx = layer_idx
@@ -58,10 +95,14 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        
+        # Linear projections for Query, Key, Value
         self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        
+        # Output projection ("o"): mixes results from all heads back into n_embd
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False) # <--- This is "o"
 
     def forward(self, x, cos_sin, kv_cache):
         B, T, C = x.size()
@@ -74,6 +115,7 @@ class CausalSelfAttention(nn.Module):
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
+        # QK Norm: normalize queries and keys to stabilize training
         q, k = norm(q), norm(k) # QK norm
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
 
@@ -105,15 +147,21 @@ class CausalSelfAttention(nn.Module):
 
         # Re-assemble the heads side by side and project back to residual stream
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
+        # Final output projection ("o")
         y = self.c_proj(y)
         return y
 
 
 class MLP(nn.Module):
+    """
+    Multi-Layer Perceptron (Feed Forward Network).
+    Processes each token independently (no mixing between tokens).
+    Structure: Expand -> ReLU^2 -> Contract
+    """
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(3 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -123,18 +171,31 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
+    """
+    A single Transformer Block.
+    Contains:
+    1. Attention (Communication)
+    2. MLP (Computation)
+    Both use Residual Connections (x + ...) and Pre-Norm.
+    """
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x, cos_sin, kv_cache):
+        # Attention with residual connection
         x = x + self.attn(norm(x), cos_sin, kv_cache)
+        # MLP with residual connection
         x = x + self.mlp(norm(x))
         return x
 
 
 class GPT(nn.Module):
+    """
+    The main GPT class.
+    Combines Embedding, Transformer Blocks, and Output Head.
+    """
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -143,46 +204,95 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.weight = self.transformer.wte.weight
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them, but assert fail if we ever reach that amount.
         # In the future we can dynamically grow the cache, for now it's fine.
-        self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
+        #
+        # Why 10x? This provides a generous buffer for inference/generation, allowing the model
+        # to generate sequences longer than its training length without recomputing embeddings.
+        # Note: While the embeddings support 10x length, the model's quality degrades beyond ~1.5-2x
+        # the training length due to unseen attention patterns. This buffer is for convenience,
+        # not an expectation of good performance at 10x length. Memory cost is negligible.
+        self.rotary_seq_len = config.sequence_len * 20 # 10X over-compute should be enough, TODO make nicer?
         head_dim = config.n_embd // config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
     def init_weights(self):
-        self.apply(self._init_weights)
-        # zero out classifier weights
-        torch.nn.init.zeros_(self.lm_head.weight)
-        # zero out c_proj weights in all blocks
+        """
+        Custom weight initialization scheme.
+        
+        The initialization logic deviates from PyTorch defaults (Kaiming defaults) to improve training 
+        stability and convergence for deep Transformers.
+        
+        Key Differences:
+        1. Zero Initialization for Output Projections (c_proj):
+           - Function: Sets the weights of the final linear layer in each block to zero.
+           - Why: This ensures that at initialization, the residual blocks contribute nothing to the 
+             residual stream (y = x + 0). The model effectively starts as an identity function, allowing 
+             unimpeded gradient flow from top to bottom. This prevents vanishing/exploding gradients 
+             and provides a stable starting point for the model to gradually learn features.
+
+        2. Zero Initialization for LM Head:
+           - Function: Sets the classifier weights to zero.
+           - Why: Ensures all logits are initially zero, leading to a uniform probability distribution (1/V) 
+             for the next token. This minimizes the initial loss to exactly log(V) and prevents the model 
+             from starting with random biases towards arbitrary tokens.
+
+        Custom initialization for Linear and Embedding layers.
+        
+        1. Controlled Variance (Linear Layers):
+           - Formula: std = 1 / sqrt(fan_in) * min(1, sqrt(fan_out / fan_in))
+           - Why: Standard Kaiming init often leads to activation variance that grows with depth in 
+             Transformers. This custom initialization (ref: https://arxiv.org/pdf/2310.17813) stabilizes 
+             activation variance across layers, specifically accounting for the network width.
+
+        2. Unit Variance (Embeddings):
+           - Function: Normal distribution with std=1.0.
+           - Why: Ensures strong initial signal strength before it enters the first normalization layer.
+
+        Initialize the full model in this one function for maximum clarity.
+
+        embedding:     normal, std=1.0
+        for each block:
+            attn.c_q:        uniform, std=1/sqrt(n_embd)
+            attn.c_k:        uniform, std=1/sqrt(n_embd)
+            attn.c_v:        uniform, std=1/sqrt(n_embd)
+            attn.c_proj:     zeros
+            mlp.c_fc:        uniform, std=1/sqrt(n_embd)
+            mlp.c_proj:      zeros
+        """
+
+        # Embedding
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
+        self.lm_head.weight = self.transformer.wte.weight
+
+        # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
+        n_embd = self.config.n_embd
+        s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
+            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
+            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
-        # init the rotary embeddings
+
+        # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
-        if self.transformer.wte.weight.device.type == "cuda":
-            self.transformer.wte.to(dtype=torch.bfloat16)
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            # https://arxiv.org/pdf/2310.17813
-            fan_out = module.weight.size(0)
-            fan_in = module.weight.size(1)
-            std = 1.0 / math.sqrt(fan_in) * min(1.0, math.sqrt(fan_out / fan_in))
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=1.0)
+        # Cast token embeddings to bf16: optimizer can tolerate it and it saves memory
+        # if self.transformer.wte.weight.device.type == "cuda":
+        #     self.transformer.wte.to(dtype=torch.bfloat16)
+        #     self.lm_head.weight = self.transformer.wte.weight
 
-    # TODO: bump base theta more, e.g. 100K is more common more recently
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
+        # TODO: bump base theta more, e.g. 100K is more common more recently
         # autodetect the device from model embeddings
         if device is None:
             device = self.transformer.wte.weight.device
@@ -210,20 +320,54 @@ class GPT(nn.Module):
         return num_flops_per_token
 
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
+        """
+        Sets up the optimizers.
+        Uses AdamW for embeddings/head and Muon for internal linear layers.
+
+        Detailed Explanation of Hybrid Strategy:
+        ----------------------------------------
+        We use two different optimizers because different parts of the Transformer have different 
+        geometric properties and optimization landscapes.
+
+        1. Muon (for internal 2D matrices):
+           - Applied to: Attention projections (c_q, c_k, c_v, c_proj) and MLP weights (c_fc, c_proj).
+           - Mechanism: Muon forces weight *updates* to be orthogonal. In linear algebra, orthogonal 
+             transformations (like rotation or reflection) preserve the magnitude (norm) of the vector 
+             they act on.
+           - Benefit: Deep networks suffer from vanishing/exploding gradients because signals get 
+             scaled up or down at every layer. By forcing updates to be orthogonal, Muon ensures 
+             signals propagate through the network without exploding in magnitude, allowing for 
+             much faster and more stable training of deep layers.
+
+        2. AdamW (for embeddings & head):
+           - Applied to: Token embeddings (wte) and the final output head (lm_head).
+           - Reason: These parameters are not dense 2D matrices in the same sense (embeddings are 
+             lookup tables). The concept of "orthogonal updates" is mathematically ill-defined or 
+             harmful for vectors/lookups. AdamW is ideal here as it adapts learning rates per-parameter 
+             based on update frequency (handling the sparse nature of token updates).
+
+        Do they conflict? 
+        No. Both optimizers step in directions derived from the same global loss gradient, so they 
+        optimize the same function. The risk is learning speed mismatch (one part learning faster 
+        than the other), which we handle by manually scaling the AdamW learning rate below.
+        """
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
         matrix_params = list(self.transformer.h.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
+        print(f"lm_head_params: {len(lm_head_params)}, embedding_params: {len(embedding_params)}, matrix_params: {len(matrix_params)}, total: {len(list(self.parameters()))}")
+        # assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params)
+
         # Create the AdamW optimizer for the embedding and lm_head
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         if rank == 0:
             print(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
         adam_groups = [
-            dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
+            # dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
         ]
         adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)

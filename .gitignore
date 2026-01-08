@@ -8,3 +8,5 @@ eval_bundle/
 documentation/gemini_logs/*
 ttst*
 .cache/*
+out
+.vscode
