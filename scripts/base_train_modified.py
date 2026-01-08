@@ -51,8 +51,8 @@ device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, i
 
 # Model architecture
 # We use a simple scaling rule: "width" and "heads" are derived from "depth".
-depth = 6 # TODO: change to 24 when training full model
-max_seq_len = 64 # TODO: change to 1024 when training full model
+depth = 4 # TODO: change to 24 when training full model
+max_seq_len = 512 # TODO: change to 1024 when training full model
 
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
@@ -63,8 +63,8 @@ target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:p
 #  To be changed for A10. 
 # TPU batch size is 32
 # TODO: Increase before training
-device_batch_size = 32 # per-device batch size (set to not OOM). This is how many sequences fit on ONE GPU. 
-total_batch_size = 4096 # total desired batch size, in #tokens. This is the mathematical batch size for optimization.
+device_batch_size = 1 # per-device batch size (set to not OOM). This is how many sequences fit on ONE GPU. 
+total_batch_size = 8 # total desired batch size, in #tokens. This is the mathematical batch size for optimization.
 # total_batch_size = 524288 # total desired batch size, in #tokens. This is the mathematical batch size for optimization.
 # If total_batch_size > (device_batch_size * num_gpus * seq_len), we use Gradient Accumulation.
 
@@ -83,12 +83,12 @@ resume_from_step = -1 # resume training from this step of the optimization (-1 =
 
 # Evaluation - monitoring progress
 # TODO: increase for training
-eval_every = 1000 # every how many steps to evaluate the model for val bpb (bits per byte)
+eval_every = 100 # every how many steps to evaluate the model for val bpb (bits per byte)
 eval_tokens = 20*total_batch_size # number of tokens to evaluate val loss on
-core_metric_every = 200 # every how many steps to evaluate the core metric (-1 = disable)
+core_metric_every = 100 # every how many steps to evaluate the core metric (-1 = disable)
 core_metric_max_per_task = 100 # examples per task in estimating the core metric
 sample_every = 100 # every how many steps to sample from the model (generate text)
-save_every = 5000 # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
+save_every = 100 # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
 
 # Output
 model_tag = "test" # optionally override the model tag for the output checkpoint directory name
@@ -137,10 +137,10 @@ tokens_per_fwdbwd = device_batch_size * max_seq_len # tokens per iteration to be
 # Gradient Accumulation: If our batch size is too big for GPU memory, we simulate it by adding up 
 # gradients over multiple small steps before updating weights.
 grad_accum_steps = total_batch_size // tokens_per_fwdbwd
-# if grad_accum_steps == 0:
-#     grad_accum_steps = 1
-#     total_batch_size = grad_accum_steps * tokens_per_fwdbwd
-#     print0(f"Warning: total_batch_size was too small. Increased to {total_batch_size} to match minimal device batch size.")
+if grad_accum_steps == 0:
+    grad_accum_steps = 1
+    total_batch_size = grad_accum_steps * tokens_per_fwdbwd
+    print0(f"Warning: total_batch_size was too small. Increased to {total_batch_size} to match minimal device batch size.")
 print0(f"Tokens / micro-batch: {device_batch_size} x {max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
@@ -270,18 +270,18 @@ while True:
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
     results = {}
-    # if core_metric_every > 0 and (last_step or (step > 0 and step % core_metric_every == 0)):
-    #     model.eval()
-    #     with autocast_ctx:
-    #         results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
-    #     print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-    #     wandb_run.log({
-    #         "step": step,
-    #         "total_training_flops": flops_so_far,
-    #         "core_metric": results["core_metric"],
-    #         "centered_results": results["centered_results"],
-    #     })
-    #     model.train()
+    if core_metric_every > 0 and (last_step or (step > 0 and step % core_metric_every == 0)):
+        model.eval()
+        with autocast_ctx:
+            results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
+        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+        wandb_run.log({
+            "step": step,
+            "total_training_flops": flops_so_far,
+            "core_metric": results["core_metric"],
+            "centered_results": results["centered_results"],
+        })
+        model.train()
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
