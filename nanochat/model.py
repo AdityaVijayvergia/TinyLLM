@@ -301,11 +301,14 @@ class GPT(nn.Module):
         """
         # Embedding
         # torch.nn.init.normal_(self.token_embedding.weight, mean=0.0, std=1.0)
-        std = 1.0 / math.sqrt(config.hidden_dim)  # ≈ 0.031 for hidden_dim=1024
-        torch.nn.init.normal_(self.token_embedding.weight, mean=0.0, std=std)
+        # std = 1.0 / math.sqrt(self.config.hidden_dim)  # ≈ 0.031 for hidden_dim=1024
+        # torch.nn.init.normal_(self.token_embedding.weight, mean=0.0, std=std)
 
-        # TODO: Also try Xavier/Glorot Initialization
+        # TODO: 1. Also try Xavier/Glorot Initialization
         # torch.nn.init.xavier_uniform_(self.token_embedding.weight)
+        # 2. Try even smaller std = 0.02 or 0.01
+        torch.nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.001)
+        self.lm_head.weight = self.token_embedding.weight
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.hidden_dim
@@ -326,9 +329,9 @@ class GPT(nn.Module):
         self.cos, self.sin = cos, sin
 
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
-        if self.token_embedding.weight.device.type == "cuda":
-            self.token_embedding.to(dtype=torch.bfloat16)
-            self.lm_head.weight = self.token_embedding.weight
+        # if self.token_embedding.weight.device.type == "cuda":
+        #     self.token_embedding.to(dtype=torch.bfloat16)
+        #     self.lm_head.weight = self.token_embedding.weight
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # autodetect the device from model embeddings

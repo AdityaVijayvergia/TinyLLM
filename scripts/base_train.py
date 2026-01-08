@@ -52,8 +52,8 @@ device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, i
 
 # Model architecture
 # We use a simple scaling rule: "width" and "heads" are derived from "depth".
-depth = 4 # TODO: change to 24 when training full model
-max_seq_len = 256 # TODO: change to 1024 when training full model
+depth = 6 # TODO: change to 24 when training full model
+max_seq_len = 64 # TODO: change to 1024 when training full model
 
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
@@ -65,7 +65,7 @@ target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:p
 # TPU batch size is 32
 # TODO: Increase before training
 device_batch_size = 32 # per-device batch size (set to not OOM). This is how many sequences fit on ONE GPU. 
-total_batch_size = 10240 # total desired batch size, in #tokens. This is the mathematical batch size for optimization.
+total_batch_size = 4096 # total desired batch size, in #tokens. This is the mathematical batch size for optimization.
 # total_batch_size = 524288 # total desired batch size, in #tokens. This is the mathematical batch size for optimization.
 # If total_batch_size > (device_batch_size * num_gpus * seq_len), we use Gradient Accumulation.
 
@@ -84,12 +84,12 @@ resume_from_step = -1 # resume training from this step of the optimization (-1 =
 
 # Evaluation - monitoring progress
 # TODO: increase for training
-eval_every = 100 # every how many steps to evaluate the model for val bpb (bits per byte)
+eval_every = 1000 # every how many steps to evaluate the model for val bpb (bits per byte)
 eval_tokens = 20*total_batch_size # number of tokens to evaluate val loss on
 core_metric_every = 200 # every how many steps to evaluate the core metric (-1 = disable)
 core_metric_max_per_task = 100 # examples per task in estimating the core metric
-sample_every = core_metric_every # every how many steps to sample from the model (generate text)
-save_every = 500 # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
+sample_every = 100 # every how many steps to sample from the model (generate text)
+save_every = 5000 # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
 
 # Output
 model_tag = "test" # optionally override the model tag for the output checkpoint directory name
@@ -240,7 +240,7 @@ else:
 
 print("starting training")
 
-
+# TODO: Add try catch to checkpoint model on failure
 # Training loop
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -267,18 +267,18 @@ while True:
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
     results = {}
-    if core_metric_every > 0 and (last_step or (step > 0 and step % core_metric_every == 0)):
-        model.eval()
-        with autocast_ctx:
-            results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
-        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
-        })
-        model.train()
+    # if core_metric_every > 0 and (last_step or (step > 0 and step % core_metric_every == 0)):
+    #     model.eval()
+    #     with autocast_ctx:
+    #         results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
+    #     print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+    #     wandb_run.log({
+    #         "step": step,
+    #         "total_training_flops": flops_so_far,
+    #         "core_metric": results["core_metric"],
+    #         "centered_results": results["centered_results"],
+    #     })
+    #     model.train()
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
@@ -374,8 +374,9 @@ while True:
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
-    promised_flops_per_sec_h100 = 989e12 * ddp_world_size # bfloat16 H100 SXM and without 2:4 sparsity
-    mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
+    promised_flops_per_sec_1660ti = 5.437e12 # float32 for 1660 Ti
+    # promised_flops_per_sec_a6000 = 5.437e12 # bfloat16 H100 SXM and without 2:4 sparsity # TODO change for A6000
+    mfu = 100 * flops_per_sec / promised_flops_per_sec_1660ti # in %
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
